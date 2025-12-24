@@ -1,0 +1,160 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_to:
+        description: "Publish destination"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+        default: testpypi
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package + test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  build:
+    name: Build dist
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.versions.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enforce origin/main
+        run: |
+          git fetch origin main
+          COMMIT="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          if ! git merge-base --is-ancestor "$COMMIT" "origin/main"; then
+            echo "Ref ${GITHUB_REF_NAME} ($COMMIT) is not contained in origin/main"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify version and tag
+        id: versions
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          version = pyproject["project"]["version"]
+
+          ref = os.environ.get("GITHUB_REF", "")
+          if ref.startswith("refs/tags/"):
+              tag = os.environ.get("GITHUB_REF_NAME", "")
+              prefix = "v"
+              if not tag.startswith(prefix):
+                  raise SystemExit(f"Expected tag to start with '{prefix}': {tag}")
+              tag_version = tag.removeprefix(prefix)
+              if tag_version != version:
+                  raise SystemExit(f"Tag/version mismatch: tag={tag_version} vs version={version}")
+
+          output_path = os.environ.get("GITHUB_OUTPUT")
+          if output_path:
+              with open(output_path, "a", encoding="utf-8") as f:
+                  f.write(f"version={version}\n")
+          print(f"arp-policy version: {version}")
+          PY
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Validate dist metadata
+        run: python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  publish:
+    name: Publish to (Test)PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to TestPyPI (trusted publishing)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/
+
+      - name: Publish to PyPI (trusted publishing)
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to == 'pypi')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  github-release:
+    name: GitHub Release
+    needs: [build, publish]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create GitHub Release (with artifacts)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.build.outputs.version, 'a') || contains(needs.build.outputs.version, 'b') || contains(needs.build.outputs.version, 'rc') }}
+          files: dist/*
+          fail_on_unmatched_files: true

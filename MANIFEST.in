@@ -1,0 +1,9 @@
+include LICENSE
+include README.md
+
+prune .venv
+prune .pytest_cache
+prune build
+prune dist
+
+global-exclude *.py[cod]
